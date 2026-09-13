@@ -97,7 +97,7 @@ export default function InfiniteCanvas() {
       panDeadzone: 2,
 
       scrollPanSpeed: 1.5,
-      scrollSmoothing: 0.12,
+      scrollSmoothing: 0.17,
       scrollHorizontal: true,
 
       inertiaDamping: 0.885,
@@ -105,7 +105,7 @@ export default function InfiniteCanvas() {
       inertiaMinThreshold: 0.0035,
 
       barrelEnabled: true,
-      barrelStrength: 0.25,
+      barrelStrength: 0.57,
       barrelK2: 0.0,
       cornerRadius: 0.0,
       vignette: 0.0,

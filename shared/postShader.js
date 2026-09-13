@@ -116,9 +116,9 @@ export const WARP_DEFAULTS = {
   warpGain: 12.0,
   /** Ceiling on the signed warp, per axis. */
   warpMax: 1.0,
-  warpBend: 0.7,
-  warpStretch: 0.35,
-  warpSplit: 0.0025,
+  warpBend: 1.7,
+  warpStretch: 1.5,
+  warpSplit: 0.003,
   /** Extra r⁴ barrel mixed in with speed — the globe bulges as you scroll. */
   warpK2: 0.9,
   /** Rise is quick so the bend snaps in; fall is slow so it settles. */

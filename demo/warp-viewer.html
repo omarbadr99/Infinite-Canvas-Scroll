@@ -318,6 +318,31 @@
   .swatch::-webkit-color-swatch { border: none; border-radius: 3px; }
   .swatch::-moz-color-swatch { border: none; border-radius: 3px; }
 
+  /* Hover labels. Fill flips with the canvas colour so they stay legible. */
+  .plate-label, .plate-desc {
+    position: fixed;
+    z-index: 15;
+    pointer-events: none;
+    text-align: center;
+    width: 320px;
+    margin-left: -160px;
+    text-wrap: balance;
+  }
+  .plate-label {
+    font-size: 17px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    line-height: 1.3;
+    color: var(--label-fg, #101418);
+    transform: translateY(-100%);
+  }
+  .plate-desc {
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--label-dim, #6b7176);
+  }
+  @media (max-width: 640px) { .plate-label, .plate-desc { display: none; } }
+
   body.chrome-off #hud, body.chrome-off #desk { opacity: 0; pointer-events: none; }
   #hud, #desk { transition: opacity .25s ease; }
 
@@ -345,6 +370,9 @@
   <div class="count"><span id="bootn">0</span>/53 PLATES</div>
 </div>
 
+<div class="plate-label" id="lt" hidden></div>
+<div class="plate-desc" id="ld" hidden></div>
+
 <div id="hud">
   <h1>Infinite Canvas</h1>
   <div class="sub">scroll-driven lens warp</div>
@@ -354,6 +382,7 @@
   </div>
   <div id="hint">
     <b>scroll</b> to warp &nbsp;&middot;&nbsp; <b>drag</b> to pan<br>
+    <b>hover</b> a plate for its caption<br>
     <b>W</b> toggle warp &nbsp;&middot;&nbsp; <b>H</b> hide panels
   </div>
 </div>
@@ -467,7 +496,7 @@ const BASE = {
   panDeadzone: 2,
 
   scrollPanSpeed: 1.5,
-  scrollSmoothing: 0.12,
+  scrollSmoothing: 0.17,
   scrollHorizontal: true,
 
   inertiaDamping: 0.885,
@@ -475,7 +504,7 @@ const BASE = {
   inertiaMinThreshold: 0.0035,
 
   barrelEnabled: true,
-  barrelStrength: 0.25,
+  barrelStrength: 0.57,
   cornerRadius: 0.0,
   vignette: 0.0,
 
@@ -538,14 +567,20 @@ function preloadAllImages() {
           bootN.textContent = ++loaded;
           resolve(payload);
         };
+        // Stand-in captions: in the Framer component these come from the
+        // CMS fields bound to each item.
+        const caption = {
+          title: `Visual ${index}`,
+          description: "Placeholder caption \u2014 title and description come from your CMS fields.",
+        };
         const img = new Image();
         img.onload = () => {
           const tex = loader.load(`Visual-${index}.png`);
           tex.minFilter = THREE.LinearFilter;
           tex.magFilter = THREE.LinearFilter;
-          done({ naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight, texture: tex });
+          done({ naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight, texture: tex, ...caption });
         };
-        img.onerror = () => done({ naturalWidth: 300, naturalHeight: 300, texture: null });
+        img.onerror = () => done({ naturalWidth: 300, naturalHeight: 300, texture: null, ...caption });
         img.src = `Visual-${index}.png`;
       });
     }),
@@ -704,6 +739,7 @@ function mkChunk(cx, cy) {
       : new THREE.MeshBasicMaterial({ color: 0x1a1a1a });
     const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
     mesh.position.set(ox + lx + w / 2, -(oy + ly + h / 2), 0);
+    mesh.userData = { title: img.title, description: img.description, h };
     g.add(mesh);
   });
   scene.add(g);
@@ -750,20 +786,85 @@ const warpS = { x: 0, y: 0 };
 
 const ray = new THREE.Raycaster();
 const mN = new THREE.Vector2();
-let hov = false;
+let pointer = null;
 
-function updH(cx, cy) {
-  if (isD) return;
-  mN.x = (cx / W) * 2 - 1;
-  mN.y = -(cy / H) * 2 + 1;
+// The pass samples the scene at lens(outputUv), so the pixel under the cursor
+// shows the scene point at lensForward(cursor) — hit testing has to go through
+// it or hover drifts badly at the edges once the barrel is strong. lensInverse
+// runs the other way to place a caption on a plate. Both are only used at rest,
+// where the warp terms vanish and the map is purely radial.
+function lensForward(x, y, k1, k2) {
+  const dx = x - 0.5, dy = y - 0.5;
+  const r2 = dx * dx + dy * dy;
+  const s = 1 / (1 + k1 * r2 + k2 * r2 * r2);
+  return [0.5 + dx * s, 0.5 + dy * s];
+}
+function lensInverse(x, y, k1, k2) {
+  const dx = x - 0.5, dy = y - 0.5;
+  const rp = Math.hypot(dx, dy);
+  if (rp < 1e-6) return [x, y];
+  let u = rp;
+  for (let i = 0; i < 8; i++) {
+    const u2 = u * u;
+    const D = 1 + k1 * u2 + k2 * u2 * u2;
+    const dD = 2 * k1 * u + 4 * k2 * u2 * u;
+    const df = (D - u * dD) / (D * D);
+    if (Math.abs(df) < 1e-9) break;
+    const next = u - (u / D - rp) / df;
+    u = next > 0 ? next : rp;
+  }
+  const s = u / rp;
+  return [0.5 + dx * s, 0.5 + dy * s];
+}
+
+const ltEl = document.getElementById("lt");
+const ldEl = document.getElementById("ld");
+let labelKey = "";
+
+function hideLabel() {
+  if (!labelKey) return;
+  labelKey = "";
+  ltEl.hidden = true;
+  ldEl.hidden = true;
+}
+
+// Captions only while the field is essentially at rest: mid-warp the plate is
+// bent and a crisp caption pinned to it reads wrong.
+function updateLabel(mag) {
+  if (!pointer || isD || mag > 0.02) { hideLabel(); return; }
+  const k1 = params.barrelStrength;
+  const k2 = postUniforms.barrelK2.value;
+  const [fx, fy] = lensForward(pointer.x / W, 1 - pointer.y / H, k1, k2);
+  mN.x = fx * 2 - 1;
+  mN.y = fy * 2 - 1;
   ray.setFromCamera(mN, camera);
   const ms = [];
   for (const [, g] of activeChunks) for (const c of g.children) ms.push(c);
-  const h = ray.intersectObjects(ms, false).length > 0;
-  if (h !== hov) {
-    hov = h;
-    cvs.style.cursor = h ? "pointer" : "grab";
-  }
+  const hit = ray.intersectObjects(ms, false)[0];
+  if (!hit) { hideLabel(); return; }
+
+  const m = hit.object;
+  const project = (wy) => {
+    const v = new THREE.Vector3(m.position.x, wy, 0).project(camera);
+    const [ox, oy] = lensInverse((v.x + 1) / 2, (v.y + 1) / 2, k1, k2);
+    return { x: ox * W, y: (1 - oy) * H };
+  };
+  const top = project(m.position.y + m.userData.h / 2);
+  const bottom = project(m.position.y - m.userData.h / 2);
+  const x = (top.x + bottom.x) / 2;
+  const key = `${m.userData.title}|${Math.round(x)}|${Math.round(top.y)}`;
+  if (key === labelKey) return;
+  labelKey = key;
+
+  ltEl.textContent = m.userData.title;
+  ltEl.style.left = `${x}px`;
+  ltEl.style.top = `${Math.max(30, top.y - 14)}px`;
+  ltEl.hidden = false;
+
+  ldEl.textContent = m.userData.description;
+  ldEl.style.left = `${x}px`;
+  ldEl.style.top = `${Math.min(H - 46, bottom.y + 14)}px`;
+  ldEl.hidden = false;
 }
 
 let isD = false, dAct = false;
@@ -776,6 +877,7 @@ cvs.addEventListener("pointerdown", (e) => {
   isD = true;
   dAct = false;
   cvs.style.cursor = "grabbing";
+  hideLabel();
   dS.x = e.clientX; dS.y = e.clientY;
   cS.x = camera.position.x; cS.y = camera.position.y;
   tX = camera.position.x; tY = camera.position.y;
@@ -788,7 +890,9 @@ cvs.addEventListener("pointerdown", (e) => {
 });
 
 cvs.addEventListener("pointermove", (e) => {
-  if (!isD) { updH(e.clientX, e.clientY); return; }
+  const r = cvs.getBoundingClientRect();
+  pointer = { x: e.clientX - r.left, y: e.clientY - r.top };
+  if (!isD) return;
   if (!dAct) {
     const dx = e.clientX - dS.x, dy = e.clientY - dS.y;
     if (Math.hypot(dx, dy) < params.panDeadzone) return;
@@ -810,12 +914,13 @@ const onUp = () => {
   if (!isD) return;
   isD = false;
   dAct = false;
-  cvs.style.cursor = hov ? "pointer" : "grab";
+  cvs.style.cursor = "grab";
   tween(dzS, "m", 1.0, params.dragZoomOutDuration, easeOutPow2);
   tween(bkS, "v", 0.0, params.dragK2OutDuration, easeOutPow2);
 };
 cvs.addEventListener("pointerup", onUp);
 cvs.addEventListener("pointercancel", onUp);
+cvs.addEventListener("pointerleave", () => { pointer = null; hideLabel(); });
 
 let lpd = 0;
 cvs.addEventListener("touchstart", (e) => {
@@ -907,12 +1012,19 @@ zoomEl.addEventListener("input", () => {
 ui.zoom.set(params.zoom);
 
 const bgEl = document.getElementById("bg");
-bgEl.addEventListener("input", () => {
-  params.bgColor = bgEl.value;
-  renderer.setClearColor(bgEl.value);
-  postUniforms.bgColor.value = hexToVec3(bgEl.value);
-  document.documentElement.style.setProperty("--ground", bgEl.value);
-});
+function applyBg(hex) {
+  params.bgColor = hex;
+  renderer.setClearColor(hex);
+  postUniforms.bgColor.value = hexToVec3(hex);
+  const root = document.documentElement.style;
+  root.setProperty("--ground", hex);
+  const c = new THREE.Color(hex);
+  const lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+  root.setProperty("--label-fg", lum > 0.5 ? "#101418" : "#f2f5f6");
+  root.setProperty("--label-dim", lum > 0.5 ? "#6b7176" : "#9aa5ab");
+}
+bgEl.addEventListener("input", () => applyBg(bgEl.value));
+applyBg(params.bgColor);
 
 const warpBtn = document.getElementById("warpon");
 function setWarpOn(on) {
@@ -944,9 +1056,7 @@ document.getElementById("reset").addEventListener("click", () => {
   }
   ui.zoom.set(params.zoom);
   bgEl.value = params.bgColor;
-  renderer.setClearColor(params.bgColor);
-  postUniforms.bgColor.value = hexToVec3(params.bgColor);
-  document.documentElement.style.setProperty("--ground", params.bgColor);
+  applyBg(params.bgColor);
   setWarpOn(params.scrollWarpEnabled);
   syncPost();
   applyZoom();
@@ -989,6 +1099,7 @@ function tick(now) {
 
   mfill.style.width = `${Math.min(100, warpMag * 100)}%`;
   mnum.textContent = warpMag.toFixed(2);
+  updateLabel(warpMag);
 
   if (isD) {
     camera.position.x += (tX - camera.position.x) * params.panSmoothing;
