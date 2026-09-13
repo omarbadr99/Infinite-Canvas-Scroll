@@ -19,14 +19,25 @@ import { useEffect, useRef, useState } from "react"
  * out of what Framer actually renders for a Collection List. The CMS stays the
  * source of truth and no private API is touched.
  *
- * ControlType.ComponentInstance does NOT list Collection Lists in its picker,
- * so the slot alone is not enough. "Source" therefore offers:
+ * The good way round this is Framer's own binding: a component placed inside a
+ * Collection List is offered the collection's fields in the variable picker.
+ * That instantiates it once per item, though, so a single instance can never
+ * see the whole set. Hence two components:
  *
- *   auto      find the biggest repeated run of images on the page — normally
- *             the Collection List — and read that. Needs no wiring.
- *   selector  a CSS selector for the list, e.g. [data-framer-name="Works"].
- *   slot      the ComponentInstance slot, for the cases where it can be filled.
- *   manual    ignore the page and use the Items array.
+ *   Canvas Item          sits inside the Collection List item, binds Image /
+ *                        Title / Description to CMS fields, draws nothing, and
+ *                        publishes its row to a named group.
+ *   Infinite Canvas Warp sits anywhere on the page, collects the group and
+ *                        draws every plate.
+ *
+ * "Source" picks where plates come from:
+ *
+ *   collection  the Canvas Items above. The supported path — use this.
+ *   auto        fall back to sniffing the rendered Collection List out of the
+ *               DOM, for when adding an item to the list is not an option.
+ *   selector    same, but with a CSS selector, e.g. [data-framer-name="Works"].
+ *   slot        the ComponentInstance slot, which cannot hold a Collection List.
+ *   manual      ignore the page and use the Items array.
  *
  * With "Hide source" on, the list it reads from is parked full-screen,
  * transparent and inert behind the canvas: off the layout, but still inside
@@ -307,8 +318,127 @@ function samePlates(a: Plate[], b: Plate[]) {
     return true
 }
 
+/* ── the plate registry ───────────────────────────────────────────────────
+   A component placed inside a Collection List is instantiated once per item,
+   so each copy only ever sees its own row. Each Canvas Item therefore
+   publishes its bound fields into this registry and renders nothing; the
+   canvas subscribes and draws the whole set. Grouping by name lets more than
+   one canvas live on a page. */
+
+type Entry = Plate & { id: string; node: HTMLElement | null }
+
+const groups = new Map<string, Map<string, Entry>>()
+const listeners = new Map<string, Set<() => void>>()
+
+function notify(group: string) {
+    listeners.get(group)?.forEach((fn) => fn())
+}
+
+function publish(group: string, entry: Entry) {
+    let g = groups.get(group)
+    if (!g) {
+        g = new Map()
+        groups.set(group, g)
+    }
+    g.set(entry.id, entry)
+    notify(group)
+}
+
+function unpublish(group: string, id: string) {
+    const g = groups.get(group)
+    if (!g || !g.delete(id)) return
+    notify(group)
+}
+
+function subscribe(group: string, fn: () => void) {
+    let set = listeners.get(group)
+    if (!set) {
+        set = new Set()
+        listeners.set(group, set)
+    }
+    set.add(fn)
+    return () => {
+        set!.delete(fn)
+    }
+}
+
+/** Entries in collection order — resolved from the DOM, since the items
+    mount in whatever order React gets to them. */
+function snapshot(group: string): Plate[] {
+    const g = groups.get(group)
+    if (!g) return []
+    return Array.from(g.values())
+        .sort((a, b) => {
+            if (!a.node || !b.node) return 0
+            const rel = a.node.compareDocumentPosition(b.node)
+            if (rel & Node.DOCUMENT_POSITION_FOLLOWING) return -1
+            if (rel & Node.DOCUMENT_POSITION_PRECEDING) return 1
+            return 0
+        })
+        .filter((e) => e.src)
+        .map(({ src, title, description }) => ({ src, title, description }))
+}
+
+function srcOf(image: any): string {
+    if (!image) return ""
+    if (typeof image === "string") return image
+    return image.src || image.url || ""
+}
+
+/**
+ * Canvas Item — drop one inside a Collection List item.
+ *
+ * Because it lives inside the list, Framer offers the collection's fields in
+ * the variable picker, so Image, Title and Description bind straight to Cover,
+ * Title and Categories. It draws nothing itself; it just hands its row to the
+ * canvas with the matching Group name.
+ *
+ * @framerIntrinsicWidth 1
+ * @framerIntrinsicHeight 1
+ * @framerSupportedLayoutWidth fixed
+ * @framerSupportedLayoutHeight fixed
+ * @framerDisableUnlink
+ */
+export function CanvasItem(props) {
+    const { group, image, title, description, style } = props
+    const ref = useRef<HTMLDivElement>(null)
+    const idRef = useRef<string>("")
+    if (!idRef.current) idRef.current = Math.random().toString(36).slice(2)
+
+    const src = srcOf(image)
+
+    useEffect(() => {
+        const id = idRef.current
+        publish(group, { id, node: ref.current, src, title: title || "", description: description || "" })
+        return () => unpublish(group, id)
+    }, [group, src, title, description])
+
+    return (
+        <div
+            ref={ref}
+            aria-hidden
+            style={{ ...style, width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+        />
+    )
+}
+
+CanvasItem.displayName = "Canvas Item"
+
+addPropertyControls(CanvasItem, {
+    group: {
+        type: ControlType.String,
+        title: "Group",
+        defaultValue: "default",
+        description: "Must match the Group on the canvas that should draw these.",
+    },
+    image: { type: ControlType.ResponsiveImage, title: "Image" },
+    title: { type: ControlType.String, title: "Title", defaultValue: "" },
+    description: { type: ControlType.String, title: "Description", defaultValue: "" },
+})
+
 export default function InfiniteCanvasWarp(props) {
     const {
+        group,
         sourceMode,
         sourceSelector,
         hideSource,
@@ -326,6 +456,7 @@ export default function InfiniteCanvasWarp(props) {
     const hostRef = useRef<HTMLDivElement>(null)
     const slotRef = useRef<HTMLDivElement>(null)
     const [harvested, setHarvested] = useState<Plate[]>([])
+    const [collected, setCollected] = useState<Plate[]>([])
     const [sourceNote, setSourceNote] = useState("")
     const [label, setLabel] = useState<{
         title: string
@@ -338,10 +469,24 @@ export default function InfiniteCanvasWarp(props) {
     const onFramerCanvas = RenderTarget.current() === RenderTarget.canvas
     const live = !onFramerCanvas || previewOnCanvas
 
+    /* Collection mode: follow the Canvas Items publishing into our group. */
+    useEffect(() => {
+        if (sourceMode !== "collection") return
+        const read = () => {
+            const next = snapshot(group)
+            setCollected((prev) => (samePlates(prev, next) ? prev : next))
+            setSourceNote(
+                next.length ? `${next.length} from collection` : `no Canvas Items in "${group}"`
+            )
+        }
+        read()
+        return subscribe(group, read)
+    }, [sourceMode, group])
+
     /* Find the Collection List and re-read whenever it renders or swaps a
        source. Framer streams items and images in, so one read is never enough. */
     useEffect(() => {
-        if (sourceMode === "manual") {
+        if (sourceMode === "collection" || sourceMode === "manual") {
             setHarvested([])
             setSourceNote("items array")
             return
@@ -435,7 +580,16 @@ export default function InfiniteCanvasWarp(props) {
         }))
         .filter((it) => it.src)
 
-    const plates = harvested.length ? harvested : manual
+    const plates =
+        sourceMode === "collection"
+            ? collected.length
+                ? collected
+                : manual
+            : sourceMode === "manual"
+              ? manual
+              : harvested.length
+                ? harvested
+                : manual
     const platesKey = plates.map((p) => p.src).join("|")
 
     useEffect(() => {
@@ -1070,7 +1224,7 @@ export default function InfiniteCanvasWarp(props) {
                     <div>Infinite Canvas Warp</div>
                     <div style={{ font: '400 11px/1.6 Inter, sans-serif', letterSpacing: 0, textTransform: "none" }}>
                         {empty
-                            ? `No images found — ${sourceNote || "looking…"}. Put a Collection List on this page, or set Source to Manual.`
+                            ? `No images yet — ${sourceNote || "looking…"}. Put a Canvas Item inside your Collection List and bind its Image field.`
                             : `${plates.length} plates · ${sourceNote} · open Preview to run it`}
                     </div>
                 </div>
@@ -1082,14 +1236,27 @@ export default function InfiniteCanvasWarp(props) {
 InfiniteCanvasWarp.displayName = "Infinite Canvas Warp"
 
 addPropertyControls(InfiniteCanvasWarp, {
+    group: {
+        type: ControlType.String,
+        title: "Group",
+        defaultValue: "default",
+        description: "Must match the Group on the Canvas Items feeding this canvas.",
+        hidden: (p) => p.sourceMode !== "collection",
+    },
     sourceMode: {
         type: ControlType.Enum,
         title: "Source",
-        options: ["auto", "selector", "slot", "manual"],
-        optionTitles: ["Auto (page)", "CSS selector", "Slot", "Manual items"],
-        defaultValue: "auto",
+        options: ["collection", "auto", "selector", "slot", "manual"],
+        optionTitles: [
+            "Canvas Items",
+            "Auto (page)",
+            "CSS selector",
+            "Slot",
+            "Manual items",
+        ],
+        defaultValue: "collection",
         description:
-            "Auto reads the Collection List on this page. Card order: image, then title text, then description text.",
+            "Canvas Items: put one inside your Collection List and bind its fields. The others read the rendered list instead.",
     },
     sourceSelector: {
         type: ControlType.String,
@@ -1103,7 +1270,7 @@ addPropertyControls(InfiniteCanvasWarp, {
         title: "Hide source",
         defaultValue: true,
         description: "Hides the Collection List it reads from, so only the canvas shows.",
-        hidden: (p) => p.sourceMode === "manual",
+        hidden: (p) => p.sourceMode === "manual" || p.sourceMode === "collection",
     },
     cmsSource: {
         type: ControlType.ComponentInstance,
