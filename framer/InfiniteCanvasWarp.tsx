@@ -15,11 +15,15 @@ import { useEffect, useRef, useState } from "react"
  * unsupported — those props are private and change without notice. The CMS API
  * that does exist is for *plugins*, not for components on a site.
  *
- * So the only supported route is the DOM: drop a real Collection List into the
+ * So the only supported route is the DOM: link a real Collection List to the
  * "CMS source" slot, and this component reads the images and text out of what
- * Framer actually renders. The list is rendered for real (offscreen, 1×1px,
- * transparent) so the browser loads the images and the CMS stays the source of
- * truth — no private APIs touched.
+ * Framer actually renders. The list is laid out at full size but transparent
+ * and inert behind the canvas, so its images genuinely load and the CMS stays
+ * the source of truth — no private APIs touched.
+ *
+ * The slot is a ControlType.ComponentInstance, so the Collection List has to
+ * exist as a frame on the same page; it is then picked from the dropdown or
+ * wired up with the outlet handle on the canvas.
  *
  * Card layout inside the Collection List:
  *   - one image per item
@@ -193,7 +197,9 @@ function readSlot(root: HTMLElement): Plate[] {
     const imgs = Array.from(root.querySelectorAll("img"))
     const out: Plate[] = []
     for (const img of imgs) {
-        const src = (img as HTMLImageElement).currentSrc || img.getAttribute("src") || ""
+        const el = img as HTMLImageElement
+        if (el.loading === "lazy") el.loading = "eager"
+        const src = el.currentSrc || el.getAttribute("src") || ""
         if (!src) continue
 
         // Climb to the item root: the tallest ancestor that still contains
@@ -841,25 +847,26 @@ export default function InfiniteCanvasWarp(props) {
                 background: canvas.background,
             }}
         >
-            {/* The Collection List renders for real so images actually load —
-                just parked at 1×1 and invisible. */}
+            {/* The Collection List renders at full size so Framer lays it out
+                and the browser treats its images as on-screen — inside a
+                collapsed box a lazy image never fetches. Invisible and inert,
+                sitting behind the canvas. */}
             <div
                 ref={slotRef}
                 aria-hidden
                 style={{
                     position: "absolute",
-                    width: 1,
-                    height: 1,
+                    inset: 0,
                     overflow: "hidden",
                     opacity: 0,
                     pointerEvents: "none",
-                    zIndex: -1,
+                    zIndex: 0,
                 }}
             >
                 {cmsSource}
             </div>
 
-            <div ref={hostRef} style={{ position: "absolute", inset: 0 }} />
+            <div ref={hostRef} style={{ position: "absolute", inset: 0, zIndex: 1 }} />
 
             {label && (label.title || label.description) && (
                 <div
@@ -870,7 +877,7 @@ export default function InfiniteCanvasWarp(props) {
                         width: hover.width,
                         marginLeft: -hover.width / 2,
                         pointerEvents: "none",
-                        zIndex: 2,
+                        zIndex: 3,
                     }}
                 >
                     {label.title && (
