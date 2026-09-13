@@ -15,15 +15,22 @@ import { useEffect, useRef, useState } from "react"
  * unsupported — those props are private and change without notice. The CMS API
  * that does exist is for *plugins*, not for components on a site.
  *
- * So the only supported route is the DOM: link a real Collection List to the
- * "CMS source" slot, and this component reads the images and text out of what
- * Framer actually renders. The list is laid out at full size but transparent
- * and inert behind the canvas, so its images genuinely load and the CMS stays
- * the source of truth — no private APIs touched.
+ * So the only supported route is the DOM: this component reads images and text
+ * out of what Framer actually renders for a Collection List. The CMS stays the
+ * source of truth and no private API is touched.
  *
- * The slot is a ControlType.ComponentInstance, so the Collection List has to
- * exist as a frame on the same page; it is then picked from the dropdown or
- * wired up with the outlet handle on the canvas.
+ * ControlType.ComponentInstance does NOT list Collection Lists in its picker,
+ * so the slot alone is not enough. "Source" therefore offers:
+ *
+ *   auto      find the biggest repeated run of images on the page — normally
+ *             the Collection List — and read that. Needs no wiring.
+ *   selector  a CSS selector for the list, e.g. [data-framer-name="Works"].
+ *   slot      the ComponentInstance slot, for the cases where it can be filled.
+ *   manual    ignore the page and use the Items array.
+ *
+ * With "Hide source" on, the list it reads from is parked full-screen,
+ * transparent and inert behind the canvas: off the layout, but still inside
+ * the viewport so its lazy images actually load.
  *
  * Card layout inside the Collection List:
  *   - one image per item
@@ -193,13 +200,59 @@ type Plate = { src: string; title: string; description: string }
 
 /* ── harvesting the Collection List ─────────────────────────────────────── */
 
-function readSlot(root: HTMLElement): Plate[] {
+/** Framer usually renders CMS images as <img>, but falls back to a CSS
+    background on some image layers — cover both. */
+function imageSources(root: HTMLElement): { node: HTMLElement; src: string }[] {
     const imgs = Array.from(root.querySelectorAll("img"))
-    const out: Plate[] = []
+    if (imgs.length) {
+        return imgs.map((img) => {
+            const el = img as HTMLImageElement
+            if (el.loading === "lazy") el.loading = "eager"
+            return { node: el, src: el.currentSrc || el.getAttribute("src") || "" }
+        })
+    }
+    const out: { node: HTMLElement; src: string }[] = []
+    root.querySelectorAll<HTMLElement>("*").forEach((el) => {
+        const bg = getComputedStyle(el).backgroundImage
+        const m = bg && bg !== "none" ? bg.match(/url\(["']?(.*?)["']?\)/) : null
+        if (m && m[1]) out.push({ node: el, src: m[1] })
+    })
+    return out
+}
+
+/** Locate the repeated run of images on the page — the Collection List. */
+function findListOnPage(exclude: HTMLElement): HTMLElement | null {
+    const imgs = Array.from(document.querySelectorAll("img")).filter(
+        (i) => !exclude.contains(i)
+    )
+    const counts = new Map<HTMLElement, number>()
     for (const img of imgs) {
-        const el = img as HTMLImageElement
-        if (el.loading === "lazy") el.loading = "eager"
-        const src = el.currentSrc || el.getAttribute("src") || ""
+        let node: HTMLElement = img
+        while (
+            node.parentElement &&
+            node.parentElement.querySelectorAll("img").length === 1
+        ) {
+            node = node.parentElement
+        }
+        const list = node.parentElement
+        if (!list || list === document.body) continue
+        counts.set(list, (counts.get(list) || 0) + 1)
+    }
+    let best: HTMLElement | null = null
+    let bestN = 1 // a lone image is a logo, not a list
+    for (const [el, n] of counts) {
+        if (n > bestN) {
+            best = el
+            bestN = n
+        }
+    }
+    return best
+}
+
+function readCards(root: HTMLElement): Plate[] {
+    const found = imageSources(root)
+    const out: Plate[] = []
+    for (const { node: img, src } of found) {
         if (!src) continue
 
         // Climb to the item root: the tallest ancestor that still contains
@@ -209,7 +262,7 @@ function readSlot(root: HTMLElement): Plate[] {
         while (
             node.parentElement &&
             node.parentElement !== root &&
-            node.parentElement.querySelectorAll("img").length === 1
+            node.parentElement.querySelectorAll("img").length <= 1
         ) {
             node = node.parentElement
         }
@@ -238,6 +291,9 @@ function samePlates(a: Plate[], b: Plate[]) {
 
 export default function InfiniteCanvasWarp(props) {
     const {
+        sourceMode,
+        sourceSelector,
+        hideSource,
         cmsSource,
         items,
         warp,
@@ -248,9 +304,11 @@ export default function InfiniteCanvasWarp(props) {
         style,
     } = props
 
+    const rootRef = useRef<HTMLDivElement>(null)
     const hostRef = useRef<HTMLDivElement>(null)
     const slotRef = useRef<HTMLDivElement>(null)
     const [harvested, setHarvested] = useState<Plate[]>([])
+    const [sourceNote, setSourceNote] = useState("")
     const [label, setLabel] = useState<{
         title: string
         description: string
@@ -262,34 +320,94 @@ export default function InfiniteCanvasWarp(props) {
     const onFramerCanvas = RenderTarget.current() === RenderTarget.canvas
     const live = !onFramerCanvas || previewOnCanvas
 
-    /* Watch the slot and re-read whenever the Collection List renders or
-       swaps a source. Framer streams images in, so one read is not enough. */
+    /* Find the Collection List and re-read whenever it renders or swaps a
+       source. Framer streams items and images in, so one read is never enough. */
     useEffect(() => {
-        const root = slotRef.current
-        if (!root) return
-        let raf = 0
-        const read = () => {
-            const next = readSlot(root)
-            setHarvested((prev) => (samePlates(prev, next) ? prev : next))
+        if (sourceMode === "manual") {
+            setHarvested([])
+            setSourceNote("items array")
+            return
         }
+        const rootEl = rootRef.current
+        if (!rootEl) return
+
+        let raf = 0
+        let parked: { el: HTMLElement; style: string } | null = null
+
+        const restore = () => {
+            if (parked) parked.el.setAttribute("style", parked.style)
+            parked = null
+        }
+
+        const locate = (): [HTMLElement | null, string] => {
+            if (sourceMode === "slot") return [slotRef.current, "slot"]
+            if (sourceMode === "selector") {
+                if (!sourceSelector) return [null, "no selector set"]
+                let found: Element | null = null
+                try {
+                    found = document.querySelector(sourceSelector)
+                } catch {
+                    return [null, "invalid selector"]
+                }
+                if (!found || rootEl.contains(found)) return [null, "selector matched nothing"]
+                return [found as HTMLElement, sourceSelector]
+            }
+            // auto: a filled slot wins, otherwise sniff the page
+            if (slotRef.current?.querySelector("img")) return [slotRef.current, "slot"]
+            const onPage = findListOnPage(rootEl)
+            return [onPage, onPage ? "page list" : "nothing found on page"]
+        }
+
+        const read = () => {
+            const [el, from] = locate()
+            const next = el ? readCards(el) : []
+            setHarvested((prev) => (samePlates(prev, next) ? prev : next))
+            setSourceNote(next.length ? `${next.length} from ${from}` : from)
+
+            // Park the list we read from: off the layout, but still inside the
+            // viewport so its lazy images keep loading.
+            if (live && hideSource && el && el !== slotRef.current) {
+                if (parked?.el !== el) {
+                    restore()
+                    parked = { el, style: el.getAttribute("style") || "" }
+                    Object.assign(el.style, {
+                        position: "fixed",
+                        top: "0",
+                        left: "0",
+                        width: "100vw",
+                        height: "100vh",
+                        overflow: "hidden",
+                        opacity: "0",
+                        pointerEvents: "none",
+                        zIndex: "-1",
+                    })
+                }
+            } else {
+                restore()
+            }
+        }
+
         read()
+        // style is deliberately absent from attributeFilter: parking the source
+        // writes style, and observing it would loop.
         const mo = new MutationObserver(() => {
             cancelAnimationFrame(raf)
             raf = requestAnimationFrame(read)
         })
-        mo.observe(root, {
+        mo.observe(document.body, {
             childList: true,
             subtree: true,
             attributes: true,
             attributeFilter: ["src", "srcset"],
         })
-        const settle = window.setTimeout(read, 600)
+        const settle = window.setTimeout(read, 900)
         return () => {
             mo.disconnect()
             cancelAnimationFrame(raf)
             window.clearTimeout(settle)
+            restore()
         }
-    }, [cmsSource])
+    }, [sourceMode, sourceSelector, hideSource, live, cmsSource])
 
     const manual: Plate[] = (items || [])
         .map((it) => ({
@@ -840,6 +958,7 @@ export default function InfiniteCanvasWarp(props) {
 
     return (
         <div
+            ref={rootRef}
             style={{
                 ...style,
                 position: "relative",
@@ -933,8 +1052,8 @@ export default function InfiniteCanvasWarp(props) {
                     <div>Infinite Canvas Warp</div>
                     <div style={{ font: '400 11px/1.6 Inter, sans-serif', letterSpacing: 0, textTransform: "none" }}>
                         {empty
-                            ? "Connect a Collection List to “CMS source”, or add items by hand."
-                            : `${plates.length} plates · open Preview to run it`}
+                            ? `No images found — ${sourceNote || "looking…"}. Put a Collection List on this page, or set Source to Manual.`
+                            : `${plates.length} plates · ${sourceNote} · open Preview to run it`}
                     </div>
                 </div>
             ) : null}
@@ -945,16 +1064,38 @@ export default function InfiniteCanvasWarp(props) {
 InfiniteCanvasWarp.displayName = "Infinite Canvas Warp"
 
 addPropertyControls(InfiniteCanvasWarp, {
+    sourceMode: {
+        type: ControlType.Enum,
+        title: "Source",
+        options: ["auto", "selector", "slot", "manual"],
+        optionTitles: ["Auto (page)", "CSS selector", "Slot", "Manual items"],
+        defaultValue: "auto",
+        description:
+            "Auto reads the Collection List on this page. Card order: image, then title text, then description text.",
+    },
+    sourceSelector: {
+        type: ControlType.String,
+        title: "Selector",
+        placeholder: '[data-framer-name="Works"]',
+        defaultValue: "",
+        hidden: (p) => p.sourceMode !== "selector",
+    },
+    hideSource: {
+        type: ControlType.Boolean,
+        title: "Hide source",
+        defaultValue: true,
+        description: "Hides the Collection List it reads from, so only the canvas shows.",
+        hidden: (p) => p.sourceMode === "manual",
+    },
     cmsSource: {
         type: ControlType.ComponentInstance,
-        title: "CMS source",
-        description:
-            "Drop a Collection List here. One image per card, first text layer is the title, second is the description.",
+        title: "Slot",
+        hidden: (p) => p.sourceMode !== "slot",
     },
     items: {
         type: ControlType.Array,
         title: "Items",
-        description: "Used only when no Collection List is connected.",
+        description: "Used when the source finds nothing, or when Source is Manual.",
         control: {
             type: ControlType.Object,
             controls: {
