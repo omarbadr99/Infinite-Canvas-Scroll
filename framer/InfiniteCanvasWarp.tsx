@@ -33,6 +33,8 @@ import { useEffect, useRef, useState } from "react"
  * "Source" picks where plates come from:
  *
  *   collection  the Canvas Items above. The supported path — use this.
+ *               Bound rows win whenever any exist, whatever Source says, so an
+ *               instance still carrying an older stored value keeps working.
  *   auto        fall back to sniffing the rendered Collection List out of the
  *               DOM, for when adding an item to the list is not an option.
  *   selector    same, but with a CSS selector, e.g. [data-framer-name="Works"].
@@ -379,6 +381,16 @@ function snapshot(group: string): Plate[] {
         .map(({ src, title, description }) => ({ src, title, description }))
 }
 
+/* One canvas is normal. Several means it was dropped inside the Collection
+   List, where Framer instantiates it per item — worth saying out loud. */
+let canvasCount = 0
+const canvasListeners = new Set<() => void>()
+
+function countCanvas(delta: number) {
+    canvasCount += delta
+    canvasListeners.forEach((fn) => fn())
+}
+
 function srcOf(image: any): string {
     if (!image) return ""
     if (typeof image === "string") return image
@@ -458,6 +470,17 @@ export default function InfiniteCanvasWarp(props) {
     const [harvested, setHarvested] = useState<Plate[]>([])
     const [collected, setCollected] = useState<Plate[]>([])
     const [sourceNote, setSourceNote] = useState("")
+    const [copies, setCopies] = useState(1)
+
+    useEffect(() => {
+        const fn = () => setCopies(canvasCount)
+        canvasListeners.add(fn)
+        countCanvas(1)
+        return () => {
+            countCanvas(-1)
+            canvasListeners.delete(fn)
+        }
+    }, [])
     const [label, setLabel] = useState<{
         title: string
         description: string
@@ -469,9 +492,12 @@ export default function InfiniteCanvasWarp(props) {
     const onFramerCanvas = RenderTarget.current() === RenderTarget.canvas
     const live = !onFramerCanvas || previewOnCanvas
 
-    /* Collection mode: follow the Canvas Items publishing into our group. */
+    /* Follow the Canvas Items publishing into our group. Deliberately not
+       gated on Source: an instance placed before this prop existed still has
+       "auto" stored on it, and real bound rows should always win over a guess
+       at the DOM. */
     useEffect(() => {
-        if (sourceMode !== "collection") return
+        if (sourceMode === "manual") return
         const read = () => {
             const next = snapshot(group)
             setCollected((prev) => (samePlates(prev, next) ? prev : next))
@@ -581,12 +607,10 @@ export default function InfiniteCanvasWarp(props) {
         .filter((it) => it.src)
 
     const plates =
-        sourceMode === "collection"
-            ? collected.length
-                ? collected
-                : manual
-            : sourceMode === "manual"
-              ? manual
+        sourceMode === "manual"
+            ? manual
+            : collected.length
+              ? collected
               : harvested.length
                 ? harvested
                 : manual
@@ -1223,9 +1247,11 @@ export default function InfiniteCanvasWarp(props) {
                 >
                     <div>Infinite Canvas Warp</div>
                     <div style={{ font: '400 11px/1.6 Inter, sans-serif', letterSpacing: 0, textTransform: "none" }}>
-                        {empty
-                            ? `No images yet — ${sourceNote || "looking…"}. Put a Canvas Item inside your Collection List and bind its Image field.`
-                            : `${plates.length} plates · ${sourceNote} · open Preview to run it`}
+                        {copies > 1
+                            ? `${copies} copies of this canvas are on the page — it is inside a Collection List. Move it out, and put a Canvas Item inside the list instead.`
+                            : empty
+                              ? `No images yet — ${sourceNote || "looking…"}. Insert a Canvas Item inside your Collection List item and bind its Image to a CMS field.`
+                              : `${plates.length} plates · ${sourceNote} · open Preview to run it`}
                     </div>
                 </div>
             ) : null}
@@ -1256,7 +1282,7 @@ addPropertyControls(InfiniteCanvasWarp, {
         ],
         defaultValue: "collection",
         description:
-            "Canvas Items: put one inside your Collection List and bind its fields. The others read the rendered list instead.",
+            "Canvas Items is the CMS path. Bound rows are always used when present, whatever this says.",
     },
     sourceSelector: {
         type: ControlType.String,
@@ -1280,7 +1306,8 @@ addPropertyControls(InfiniteCanvasWarp, {
     items: {
         type: ControlType.Array,
         title: "Items",
-        description: "Used when the source finds nothing, or when Source is Manual.",
+        description:
+            "Hand-uploaded fallback. Framer does not offer CMS variables inside array entries — for CMS content use Canvas Items.",
         control: {
             type: ControlType.Object,
             controls: {
