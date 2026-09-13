@@ -461,6 +461,7 @@ export default function InfiniteCanvasWarp(props) {
         canvas,
         hover,
         previewOnCanvas,
+        debug,
         style,
     } = props
 
@@ -471,6 +472,7 @@ export default function InfiniteCanvasWarp(props) {
     const [collected, setCollected] = useState<Plate[]>([])
     const [sourceNote, setSourceNote] = useState("")
     const [copies, setCopies] = useState(1)
+    const [stats, setStats] = useState<any>(null)
 
     useEffect(() => {
         const fn = () => setCopies(canvasCount)
@@ -702,43 +704,76 @@ export default function InfiniteCanvasWarp(props) {
         const loader = new THREE.TextureLoader()
         loader.setCrossOrigin("anonymous")
 
-        const loadAll = Promise.all(
-            plates.map(
-                (p) =>
-                    new Promise<any>((resolve) => {
-                        const img = new Image()
-                        img.crossOrigin = "anonymous"
-                        img.onload = () => {
-                            const tex = loader.load(p.src)
-                            tex.minFilter = THREE.LinearFilter
-                            tex.magFilter = THREE.LinearFilter
-                            // Cap the long edge so an oversized CMS upload does
-                            // not blow the layout apart; aspect is preserved.
-                            const long = Math.max(img.naturalWidth, img.naturalHeight)
-                            const k =
-                                long * canvas.plateScale > canvas.maxPlate
-                                    ? canvas.maxPlate / (long * canvas.plateScale)
-                                    : 1
-                            resolve({
-                                w: img.naturalWidth * canvas.plateScale * k,
-                                h: img.naturalHeight * canvas.plateScale * k,
-                                texture: tex,
-                                title: p.title,
-                                description: p.description,
-                            })
-                        }
-                        img.onerror = () =>
-                            resolve({
-                                w: 420,
-                                h: 420,
-                                texture: null,
-                                title: p.title,
-                                description: p.description,
-                            })
-                        img.src = p.src
-                    })
-            )
-        )
+        /* Every plate exists from the first frame as a neutral placeholder and
+           gets its texture swapped in when it arrives. Waiting for the whole
+           set meant a single stalled request left the canvas blank — and a CDN
+           that never answers has no error to wait for, so there was nothing to
+           recover from. Each request also gets its own deadline. */
+        imageData = plates.map((p) => ({
+            w: 420,
+            h: 420,
+            texture: null as THREE.Texture | null,
+            title: p.title,
+            description: p.description,
+        }))
+
+        let loadedCount = 0
+        let failedCount = 0
+        const timers: number[] = []
+
+        let rebuildQueued = false
+        function queueRebuild() {
+            if (rebuildQueued || disposed) return
+            rebuildQueued = true
+            requestAnimationFrame(() => {
+                rebuildQueued = false
+                if (disposed) return
+                for (const [, g] of activeChunks) rmChunk(g)
+                activeChunks.clear()
+                chunkImgCache.clear()
+                lastCx = null
+                lastCy = null
+                updChunks()
+            })
+        }
+
+        plates.forEach((p, i) => {
+            const img = new Image()
+            img.crossOrigin = "anonymous"
+            let settled = false
+            const finish = (ok: boolean) => {
+                if (settled || disposed) return
+                settled = true
+                window.clearTimeout(timer)
+                ok ? loadedCount++ : failedCount++
+                queueRebuild()
+            }
+            const timer = window.setTimeout(() => finish(false), 12000)
+            timers.push(timer)
+            img.onload = () => {
+                if (disposed) return
+                const tex = loader.load(p.src)
+                tex.minFilter = THREE.LinearFilter
+                tex.magFilter = THREE.LinearFilter
+                // Cap the long edge so an oversized CMS upload cannot blow the
+                // layout apart; aspect is preserved.
+                const long = Math.max(img.naturalWidth, img.naturalHeight)
+                const k =
+                    long * canvas.plateScale > canvas.maxPlate
+                        ? canvas.maxPlate / (long * canvas.plateScale)
+                        : 1
+                imageData[i] = {
+                    w: img.naturalWidth * canvas.plateScale * k,
+                    h: img.naturalHeight * canvas.plateScale * k,
+                    texture: tex,
+                    title: p.title,
+                    description: p.description,
+                }
+                finish(true)
+            }
+            img.onerror = () => finish(false)
+            img.src = p.src
+        })
 
         /* ── chunks ── */
         const activeChunks = new Map<string, THREE.Group>()
@@ -1009,9 +1044,25 @@ export default function InfiniteCanvasWarp(props) {
         /* ── loop ── */
         let raf = 0
         let labelKey = ""
+        let frames = 0
+
+        // Heartbeat for the Debug readout: cheap, and off the render path.
+        const beat = window.setInterval(() => {
+            if (disposed) return
+            setStats({
+                plates: plates.length,
+                loaded: loadedCount,
+                failed: failedCount,
+                frames,
+                size: `${W}x${H}`,
+                meshes: Array.from(activeChunks.values()).reduce((n, g) => n + g.children.length, 0),
+                first: plates[0] ? plates[0].src.slice(0, 64) : "-",
+            })
+        }, 700)
 
         const tick = () => {
             raf = requestAnimationFrame(tick)
+            frames++
             const now = performance.now()
             advance(dz, dzEase, now)
             advance(bk, bkEase, now)
@@ -1118,17 +1169,15 @@ export default function InfiniteCanvasWarp(props) {
             renderer.render(postScene, postCam)
         }
 
-        loadAll.then((data) => {
-            if (disposed) return
-            imageData = data
-            applyZoom()
-            updChunks()
-            tick()
-        })
+        applyZoom()
+        updChunks()
+        tick()
 
         return () => {
             disposed = true
             cancelAnimationFrame(raf)
+            window.clearInterval(beat)
+            timers.forEach((t) => window.clearTimeout(t))
             ro.disconnect()
             cvs.removeEventListener("pointerdown", onDown)
             cvs.removeEventListener("pointermove", onMove)
@@ -1224,6 +1273,31 @@ export default function InfiniteCanvasWarp(props) {
                             {label.description}
                         </div>
                     )}
+                </div>
+            )}
+
+            {debug && stats && (
+                <div
+                    style={{
+                        position: "absolute",
+                        top: 8,
+                        left: 8,
+                        zIndex: 4,
+                        maxWidth: "calc(100% - 16px)",
+                        padding: "8px 10px",
+                        borderRadius: 6,
+                        background: "rgba(13,16,19,0.88)",
+                        color: "#e9eef0",
+                        font: '500 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace',
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-all",
+                        pointerEvents: "none",
+                    }}
+                >
+                    {`plates ${stats.plates} · loaded ${stats.loaded} · failed ${stats.failed}
+frames ${stats.frames} · meshes ${stats.meshes} · ${stats.size}
+source ${sourceNote || "—"}
+${stats.first}`}
                 </div>
             )}
 
@@ -1392,6 +1466,12 @@ addPropertyControls(InfiniteCanvasWarp, {
             inertiaScale: { type: ControlType.Number, title: "Inertia scale", min: 1, max: 40, step: 1, defaultValue: 20 },
             inertiaThreshold: { type: ControlType.Number, title: "Inertia cutoff", min: 0.0001, max: 0.01, step: 0.0001, defaultValue: 0.0035 },
         },
+    },
+    debug: {
+        type: ControlType.Boolean,
+        title: "Debug",
+        defaultValue: false,
+        description: "Overlays what it found and whether the images loaded.",
     },
     previewOnCanvas: {
         type: ControlType.Boolean,
