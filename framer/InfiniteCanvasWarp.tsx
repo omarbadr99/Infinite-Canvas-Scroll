@@ -220,9 +220,26 @@ function imageSources(root: HTMLElement): { node: HTMLElement; src: string }[] {
     return out
 }
 
-/** Locate the repeated run of images on the page — the Collection List. */
+/** The nearest ancestor that holds real imagery besides our own.
+    Framer lays every breakpoint out in the same document, so searching from
+    <body> can pick up the Tablet frame's copy of the list. Climbing from the
+    component keeps the search inside the frame it actually sits in. */
+function searchScope(root: HTMLElement): HTMLElement {
+    let node = root.parentElement
+    while (node && node !== document.body) {
+        const n = Array.from(node.querySelectorAll("img")).filter(
+            (i) => !root.contains(i)
+        ).length
+        if (n >= 2) return node
+        node = node.parentElement
+    }
+    return document.body
+}
+
+/** Locate the repeated run of images near the component — the Collection List. */
 function findListOnPage(exclude: HTMLElement): HTMLElement | null {
-    const imgs = Array.from(document.querySelectorAll("img")).filter(
+    const scope = searchScope(exclude)
+    const imgs = Array.from(scope.querySelectorAll("img")).filter(
         (i) => !exclude.contains(i)
     )
     const counts = new Map<HTMLElement, number>()
@@ -236,6 +253,7 @@ function findListOnPage(exclude: HTMLElement): HTMLElement | null {
         }
         const list = node.parentElement
         if (!list || list === document.body) continue
+        if (exclude.contains(list)) continue
         counts.set(list, (counts.get(list) || 0) + 1)
     }
     let best: HTMLElement | null = null
