@@ -4,6 +4,12 @@ import React, { useEffect, useRef } from "react";
 import * as THREE from "three";
 import GUI from "lil-gui";
 import gsap from "gsap";
+import {
+  POST_VS,
+  POST_FS,
+  WARP_DEFAULTS,
+  stepWarp,
+} from "@/shared/postShader";
 
 function mulberry32(a) {
   return function () {
@@ -60,69 +66,6 @@ function preloadAllImages() {
   );
 }
 
-const POST_VS = /* glsl */ `
-  varying vec2 vUv;
-  void main() {
-    vUv = uv;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-  }
-`;
-
-const POST_FS = /* glsl */ `
-  precision highp float;
-  varying vec2 vUv;
-
-  uniform sampler2D tDiffuse;
-  uniform float barrelStrength;
-  uniform float barrelK2;
-  uniform float aspect;
-  uniform float cornerRadius;
-  uniform float vignette;
-  uniform vec3 bgColor;
-  uniform float enabled;
-
-  float roundedBoxSDF(vec2 p, vec2 b, float r) {
-    vec2 q = abs(p) - b + r;
-    return length(max(q, 0.0)) - r;
-  }
-
-  void main() {
-    vec2 uv = vUv;
-
-   if (enabled > 0.5) {
-  vec2 center = vec2(0.5);
-  vec2 d = uv - center;
-
-  float r2 = dot(d, d);
-  float r4 = r2 * r2;
-
-  float distort = 1.0 + barrelStrength * r2 + barrelK2 * r4;
-  d /= distort;
-
-  uv = center + d;
-}
-    uv = clamp(uv, vec2(0.0), vec2(1.0));
-    vec4 color = texture2D(tDiffuse, uv);
-
-    if (vignette > 0.0) {
-      vec2 vc = vUv - 0.5;
-      vc.x *= aspect;
-      float vr = dot(vc, vc);
-      color.rgb *= 1.0 - vignette * smoothstep(0.15, 0.6, vr);
-    }
-
-    if (cornerRadius > 0.001) {
-      vec2 p = vUv - 0.5;
-      vec2 halfSize = vec2(0.5);
-      float dist = roundedBoxSDF(p, halfSize, cornerRadius);
-      float mask = 1.0 - smoothstep(-0.003, 0.003, dist);
-      color = mix(vec4(bgColor, 1.0), color, mask);
-    }
-
-    gl_FragColor = color;
-  }
-`;
-
 export default function InfiniteCanvas() {
   const containerRef = useRef(null);
 
@@ -173,6 +116,8 @@ export default function InfiniteCanvas() {
       dragK2OutDuration: 0.85,
       dragK2EaseIn: "circ.out",
       dragK2EaseOut: "power2.out",
+
+      ...WARP_DEFAULTS,
     };
 
     /* ── renderer ── */
@@ -241,6 +186,11 @@ export default function InfiniteCanvas() {
       vignette: { value: params.vignette },
       bgColor: { value: hexToVec3(params.bgColor) },
       enabled: { value: 1.0 },
+
+      warp: { value: new THREE.Vector2(0, 0) },
+      bend: { value: WARP_DEFAULTS.warpBend },
+      stretch: { value: WARP_DEFAULTS.warpStretch },
+      split: { value: WARP_DEFAULTS.warpSplit },
     };
 
     const postMat = new THREE.ShaderMaterial({
@@ -264,6 +214,9 @@ export default function InfiniteCanvas() {
       postUniforms.vignette.value = params.vignette;
       postUniforms.enabled.value = params.barrelEnabled ? 1.0 : 0.0;
       postUniforms.aspect.value = W / H;
+      postUniforms.bend.value = params.warpBend;
+      postUniforms.stretch.value = params.warpStretch;
+      postUniforms.split.value = params.warpSplit;
     }
 
     /* ── chunks ── */
@@ -416,15 +369,14 @@ export default function InfiniteCanvas() {
     /* ── GSAP drag barrel-K2 ── */
     let bkT = null;
     const bkS = { v: 0.0 };
+    // Signed scroll travel, in viewport fractions, driving the warp.
+    const warpS = { x: 0, y: 0 };
     function animK2(target, duration, ease) {
       if (bkT) bkT.kill();
       bkT = gsap.to(bkS, {
         v: target,
         duration,
         ease,
-        onUpdate: () => {
-          postUniforms.barrelK2.value = bkS.v;
-        },
       });
     }
 
@@ -550,6 +502,21 @@ export default function InfiniteCanvas() {
       .name("Drag-Out Duration");
     fK2.add(params, "dragK2EaseIn", EA).name("Drag-In Easing");
     fK2.add(params, "dragK2EaseOut", EA).name("Drag-Out Easing");
+
+    const fW = gui.addFolder("Scroll Warp");
+    fW.add(params, "scrollWarpEnabled").name("Enabled");
+    fW.add(params, "warpBend", 0.0, 2.0, 0.01).name("Bend").onChange(syncPost);
+    fW.add(params, "warpStretch", 0.0, 1.5, 0.01)
+      .name("Stretch")
+      .onChange(syncPost);
+    fW.add(params, "warpK2", 0.0, 3.0, 0.05).name("Globe Bulge (r\u2074)");
+    fW.add(params, "warpSplit", 0.0, 0.05, 0.001)
+      .name("Chromatic Split")
+      .onChange(syncPost);
+    fW.add(params, "warpGain", 0.0, 40.0, 0.5).name("Velocity Gain");
+    fW.add(params, "warpMax", 0.1, 2.0, 0.05).name("Max Warp");
+    fW.add(params, "warpAttack", 0.02, 1.0, 0.01).name("Attack");
+    fW.add(params, "warpRelease", 0.005, 0.5, 0.005).name("Release");
 
     /* ── raycaster ── */
     const ray = new THREE.Raycaster();
@@ -717,6 +684,20 @@ export default function InfiniteCanvas() {
         cS.x += sdx;
         cS.y += sdy;
       }
+
+      // sdx/sdy are the smoothed world-space steps actually applied to the
+      // camera this frame; scaled by zoom and viewport they give the
+      // fraction of the screen the canvas travelled. Negated so the far
+      // edges trail the motion instead of leading it.
+      const on = params.scrollWarpEnabled;
+      const warpMag = stepWarp(
+        warpS,
+        on ? -(sdx * z) / W : 0,
+        on ? -(sdy * z) / H : 0,
+        params,
+      );
+      postUniforms.warp.value.set(warpS.x, warpS.y);
+      postUniforms.barrelK2.value = bkS.v + params.warpK2 * warpMag;
 
       if (isD) {
         const s = params.panSmoothing;
