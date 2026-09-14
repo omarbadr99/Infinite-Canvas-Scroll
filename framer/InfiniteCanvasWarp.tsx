@@ -209,7 +209,7 @@ function lensInverse(x: number, y: number, k1: number, k2: number) {
     return [0.5 + dx * s, 0.5 + dy * s]
 }
 
-type Plate = { src: string; title: string; description: string }
+type Plate = { src: string; title: string; description: string; video?: string }
 
 /* ── harvesting the Collection List ─────────────────────────────────────── */
 
@@ -313,7 +313,12 @@ function readCards(root: HTMLElement): Plate[] {
 function samePlates(a: Plate[], b: Plate[]) {
     if (a.length !== b.length) return false
     for (let i = 0; i < a.length; i++) {
-        if (a[i].src !== b[i].src || a[i].title !== b[i].title || a[i].description !== b[i].description) {
+        if (
+            a[i].src !== b[i].src ||
+            a[i].video !== b[i].video ||
+            a[i].title !== b[i].title ||
+            a[i].description !== b[i].description
+        ) {
             return false
         }
     }
@@ -377,8 +382,9 @@ function snapshot(group: string): Plate[] {
             if (rel & Node.DOCUMENT_POSITION_PRECEDING) return 1
             return 0
         })
-        .filter((e) => e.src)
-        .map(({ src, title, description }) => ({ src, title, description }))
+        // A row needs something to draw: a video, or a still.
+        .filter((e) => e.src || e.video)
+        .map(({ src, title, description, video }) => ({ src, title, description, video }))
 }
 
 /* One canvas is normal. Several means it was dropped inside the Collection
@@ -412,7 +418,7 @@ function srcOf(image: any): string {
  * @framerDisableUnlink
  */
 export function CanvasItem(props) {
-    const { group, image, title, description, style } = props
+    const { group, image, video, title, description, style } = props
     const ref = useRef<HTMLDivElement>(null)
     const idRef = useRef<string>("")
     if (!idRef.current) idRef.current = Math.random().toString(36).slice(2)
@@ -421,9 +427,16 @@ export function CanvasItem(props) {
 
     useEffect(() => {
         const id = idRef.current
-        publish(group, { id, node: ref.current, src, title: title || "", description: description || "" })
+        publish(group, {
+            id,
+            node: ref.current,
+            src,
+            video: typeof video === "string" ? video : "",
+            title: title || "",
+            description: description || "",
+        })
         return () => unpublish(group, id)
-    }, [group, src, title, description])
+    }, [group, src, video, title, description])
 
     return (
         <div
@@ -444,6 +457,13 @@ addPropertyControls(CanvasItem, {
         description: "Must match the Group on the canvas that should draw these.",
     },
     image: { type: ControlType.ResponsiveImage, title: "Image" },
+    video: {
+        type: ControlType.File,
+        title: "Video",
+        allowedFileTypes: ["mp4", "webm", "m4v", "mov"],
+        description:
+            "Optional. Plays on the plate instead of the image. A GIF cannot animate as a texture — use a video.",
+    },
     title: { type: ControlType.String, title: "Title", defaultValue: "" },
     description: { type: ControlType.String, title: "Description", defaultValue: "" },
 })
@@ -719,7 +739,37 @@ export default function InfiniteCanvasWarp(props) {
 
         let loadedCount = 0
         let failedCount = 0
+        let videoCount = 0
         const timers: number[] = []
+        const videos: HTMLVideoElement[] = []
+
+        /* Videos live in the document rather than detached: Safari in
+           particular is unreliable about decoding and playing an element that
+           was never attached. Parked at 1px and invisible, but inside the
+           viewport so nothing throttles them. */
+        const videoBin = document.createElement("div")
+        Object.assign(videoBin.style, {
+            position: "absolute",
+            left: "0",
+            top: "0",
+            width: "1px",
+            height: "1px",
+            overflow: "hidden",
+            opacity: "0",
+            pointerEvents: "none",
+        })
+        videoBin.setAttribute("aria-hidden", "true")
+        host.appendChild(videoBin)
+
+        // Long edge cap, so an oversized upload cannot blow the layout apart.
+        const fit = (w: number, h: number) => {
+            const long = Math.max(w, h)
+            const k =
+                long * canvas.plateScale > canvas.maxPlate
+                    ? canvas.maxPlate / (long * canvas.plateScale)
+                    : 1
+            return { w: w * canvas.plateScale * k, h: h * canvas.plateScale * k }
+        }
 
         let rebuildQueued = false
         function queueRebuild() {
@@ -738,6 +788,10 @@ export default function InfiniteCanvasWarp(props) {
         }
 
         plates.forEach((p, i) => {
+            if (p.video) {
+                loadVideo(p, i)
+                return
+            }
             const img = new Image()
             img.crossOrigin = "anonymous"
             let settled = false
@@ -755,16 +809,10 @@ export default function InfiniteCanvasWarp(props) {
                 const tex = loader.load(p.src)
                 tex.minFilter = THREE.LinearFilter
                 tex.magFilter = THREE.LinearFilter
-                // Cap the long edge so an oversized CMS upload cannot blow the
-                // layout apart; aspect is preserved.
-                const long = Math.max(img.naturalWidth, img.naturalHeight)
-                const k =
-                    long * canvas.plateScale > canvas.maxPlate
-                        ? canvas.maxPlate / (long * canvas.plateScale)
-                        : 1
+                const size = fit(img.naturalWidth, img.naturalHeight)
                 imageData[i] = {
-                    w: img.naturalWidth * canvas.plateScale * k,
-                    h: img.naturalHeight * canvas.plateScale * k,
+                    w: size.w,
+                    h: size.h,
                     texture: tex,
                     title: p.title,
                     description: p.description,
@@ -774,6 +822,56 @@ export default function InfiniteCanvasWarp(props) {
             img.onerror = () => finish(false)
             img.src = p.src
         })
+
+        /* A GIF only animates as an <img> in the document; sampled into a
+           texture it freezes on whichever frame was decoded. A <video> does
+           update, so moving plates come from a real video file. Muted and
+           inline so autoplay is permitted. */
+        function loadVideo(p: Plate, i: number) {
+            const el = document.createElement("video")
+            el.crossOrigin = "anonymous"
+            el.muted = true
+            el.loop = true
+            el.playsInline = true
+            el.autoplay = true
+            el.preload = "auto"
+            el.setAttribute("muted", "")
+            el.setAttribute("playsinline", "")
+            videos.push(el)
+            videoBin.appendChild(el)
+
+            let settled = false
+            const finish = (ok: boolean) => {
+                if (settled || disposed) return
+                settled = true
+                window.clearTimeout(timer)
+                ok ? (loadedCount++, videoCount++) : failedCount++
+                queueRebuild()
+            }
+            const timer = window.setTimeout(() => finish(false), 12000)
+            timers.push(timer)
+
+            el.onloadeddata = () => {
+                if (disposed) return
+                const tex = new THREE.VideoTexture(el)
+                tex.minFilter = THREE.LinearFilter
+                tex.magFilter = THREE.LinearFilter
+                const size = fit(el.videoWidth || 640, el.videoHeight || 360)
+                imageData[i] = {
+                    w: size.w,
+                    h: size.h,
+                    texture: tex,
+                    title: p.title,
+                    description: p.description,
+                }
+                // A blocked autoplay must not fail the plate — the frame that
+                // is already decoded still draws.
+                el.play().catch(() => {})
+                finish(true)
+            }
+            el.onerror = () => finish(false)
+            el.src = p.video as string
+        }
 
         /* ── chunks ── */
         const activeChunks = new Map<string, THREE.Group>()
@@ -1053,6 +1151,7 @@ export default function InfiniteCanvasWarp(props) {
                 plates: plates.length,
                 loaded: loadedCount,
                 failed: failedCount,
+                videos: videoCount,
                 frames,
                 size: `${W}x${H}`,
                 meshes: Array.from(activeChunks.values()).reduce((n, g) => n + g.children.length, 0),
@@ -1178,6 +1277,12 @@ export default function InfiniteCanvasWarp(props) {
             cancelAnimationFrame(raf)
             window.clearInterval(beat)
             timers.forEach((t) => window.clearTimeout(t))
+            videos.forEach((v) => {
+                v.pause()
+                v.removeAttribute("src")
+                v.load()
+            })
+            if (videoBin.parentNode) videoBin.parentNode.removeChild(videoBin)
             ro.disconnect()
             cvs.removeEventListener("pointerdown", onDown)
             cvs.removeEventListener("pointermove", onMove)
@@ -1294,7 +1399,7 @@ export default function InfiniteCanvasWarp(props) {
                         pointerEvents: "none",
                     }}
                 >
-                    {`plates ${stats.plates} · loaded ${stats.loaded} · failed ${stats.failed}
+                    {`plates ${stats.plates} · loaded ${stats.loaded} · failed ${stats.failed} · video ${stats.videos}
 frames ${stats.frames} · meshes ${stats.meshes} · ${stats.size}
 source ${sourceNote || "—"}
 ${stats.first}`}
