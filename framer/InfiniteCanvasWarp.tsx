@@ -209,7 +209,7 @@ function lensInverse(x: number, y: number, k1: number, k2: number) {
     return [0.5 + dx * s, 0.5 + dy * s]
 }
 
-type Plate = { src: string; title: string; description: string; video?: string }
+type Plate = { src: string; title: string; description: string; video?: string; srcSet?: string }
 
 /* ── harvesting the Collection List ─────────────────────────────────────── */
 
@@ -384,7 +384,13 @@ function snapshot(group: string): Plate[] {
         })
         // A row needs something to draw: a video, or a still.
         .filter((e) => e.src || e.video)
-        .map(({ src, title, description, video }) => ({ src, title, description, video }))
+        .map(({ src, title, description, video, srcSet }) => ({
+            src,
+            title,
+            description,
+            video,
+            srcSet,
+        }))
 }
 
 /* One canvas is normal. Several means it was dropped inside the Collection
@@ -395,6 +401,23 @@ const canvasListeners = new Set<() => void>()
 function countCanvas(delta: number) {
     canvasCount += delta
     canvasListeners.forEach((fn) => fn())
+}
+
+/** Framer serves the full-resolution original in `src` and scaled variants in
+    `srcSet`. A plate is drawn a few hundred pixels across, so pulling the
+    original is mostly wasted bytes — take the smallest variant that still
+    covers the size we draw at. */
+function pickSized(srcSet: string, targetW: number, fallback: string): string {
+    if (!srcSet) return fallback
+    const candidates = srcSet
+        .split(",")
+        .map((part) => part.trim().split(/\s+/))
+        .map(([url, w]) => ({ url, w: parseInt(w || "0", 10) }))
+        .filter((c) => c.url && c.w > 0)
+        .sort((a, b) => a.w - b.w)
+    if (!candidates.length) return fallback
+    const pick = candidates.find((c) => c.w >= targetW) || candidates[candidates.length - 1]
+    return pick.url
 }
 
 function srcOf(image: any): string {
@@ -424,6 +447,9 @@ export function CanvasItem(props) {
     if (!idRef.current) idRef.current = Math.random().toString(36).slice(2)
 
     const src = srcOf(image)
+    // Framer also hands over scaled variants; the canvas picks one that suits
+    // the size a plate is actually drawn at.
+    const srcSet = image && typeof image === "object" ? (image as any).srcSet || "" : ""
 
     useEffect(() => {
         const id = idRef.current
@@ -431,12 +457,13 @@ export function CanvasItem(props) {
             id,
             node: ref.current,
             src,
+            srcSet,
             video: typeof video === "string" ? video : "",
             title: title || "",
             description: description || "",
         })
         return () => unpublish(group, id)
-    }, [group, src, video, title, description])
+    }, [group, src, srcSet, video, title, description])
 
     return (
         <div
@@ -680,6 +707,15 @@ export default function InfiniteCanvasWarp(props) {
             format: THREE.RGBAFormat,
         })
 
+        /* A plate with no texture yet sits a hair off the background rather
+           than the near-black it used to be: a slow or failed image reads as
+           loading, not as a broken black rectangle. */
+        const pendingColor = (() => {
+            const c = new THREE.Color(canvas.background)
+            const lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+            return c.clone().lerp(new THREE.Color(lum > 0.5 ? 0x000000 : 0xffffff), 0.07)
+        })()
+
         const bgVec = () => {
             const c = new THREE.Color(canvas.background)
             return new THREE.Vector3(c.r, c.g, c.b)
@@ -721,9 +757,6 @@ export default function InfiniteCanvasWarp(props) {
             description: string
         }[] = []
 
-        const loader = new THREE.TextureLoader()
-        loader.setCrossOrigin("anonymous")
-
         /* Every plate exists from the first frame as a neutral placeholder and
            gets its texture swapped in when it arrives. Waiting for the whole
            set meant a single stalled request left the canvas blank — and a CDN
@@ -737,9 +770,17 @@ export default function InfiniteCanvasWarp(props) {
             description: p.description,
         }))
 
+        // What a plate is worth fetching at: its capped size, at this screen's
+        // density, and never beyond a sane texture width.
+        const targetW = Math.min(
+            2048,
+            Math.round(canvas.maxPlate * Math.min(window.devicePixelRatio || 1, 2))
+        )
+
         let loadedCount = 0
         let failedCount = 0
         let videoCount = 0
+        let firstUrl = ""
         const timers: number[] = []
         const videos: HTMLVideoElement[] = []
 
@@ -806,9 +847,15 @@ export default function InfiniteCanvasWarp(props) {
             timers.push(timer)
             img.onload = () => {
                 if (disposed) return
-                const tex = loader.load(p.src)
+                // Build the texture from the element we just decoded rather
+                // than handing the URL to TextureLoader: that fetched every
+                // image a second time, and returned a texture whose pixels had
+                // not arrived yet, so the first frames sampled an empty — black
+                // — texture.
+                const tex = new THREE.Texture(img)
                 tex.minFilter = THREE.LinearFilter
                 tex.magFilter = THREE.LinearFilter
+                tex.needsUpdate = true
                 const size = fit(img.naturalWidth, img.naturalHeight)
                 imageData[i] = {
                     w: size.w,
@@ -820,7 +867,9 @@ export default function InfiniteCanvasWarp(props) {
                 finish(true)
             }
             img.onerror = () => finish(false)
-            img.src = p.src
+            const url = pickSized(p.srcSet || "", targetW, p.src)
+            if (!firstUrl) firstUrl = url
+            img.src = url
         })
 
         /* A GIF only animates as an <img> in the document; sampled into a
@@ -834,7 +883,10 @@ export default function InfiniteCanvasWarp(props) {
             el.loop = true
             el.playsInline = true
             el.autoplay = true
-            el.preload = "auto"
+            // metadata, not auto: eight videos each pulling their whole file
+            // before the first frame can draw is most of the wait. play()
+            // streams the rest.
+            el.preload = "metadata"
             el.setAttribute("muted", "")
             el.setAttribute("playsinline", "")
             videos.push(el)
@@ -871,6 +923,10 @@ export default function InfiniteCanvasWarp(props) {
             }
             el.onerror = () => finish(false)
             el.src = p.video as string
+            // With preload="metadata" the browser may never reach loadeddata on
+            // its own, and that is where the texture is built — so ask for
+            // playback straight away and let it stream from there.
+            el.play().catch(() => {})
         }
 
         /* ── chunks ── */
@@ -938,7 +994,7 @@ export default function InfiniteCanvasWarp(props) {
 
                 const mat = img.texture
                     ? new THREE.MeshBasicMaterial({ map: img.texture })
-                    : new THREE.MeshBasicMaterial({ color: 0x1a1a1a })
+                    : new THREE.MeshBasicMaterial({ color: pendingColor })
                 const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat)
                 mesh.position.set(ox + px + w / 2, -(oy + py + h / 2), 0)
                 mesh.userData = { title: img.title, description: img.description, h }
@@ -1155,7 +1211,8 @@ export default function InfiniteCanvasWarp(props) {
                 frames,
                 size: `${W}x${H}`,
                 meshes: Array.from(activeChunks.values()).reduce((n, g) => n + g.children.length, 0),
-                first: plates[0] ? plates[0].src.slice(0, 64) : "-",
+                target: targetW,
+                first: (firstUrl || (plates[0] ? plates[0].src : "-")).slice(0, 64),
             })
         }, 700)
 
@@ -1400,7 +1457,7 @@ export default function InfiniteCanvasWarp(props) {
                     }}
                 >
                     {`plates ${stats.plates} · loaded ${stats.loaded} · failed ${stats.failed} · video ${stats.videos}
-frames ${stats.frames} · meshes ${stats.meshes} · ${stats.size}
+frames ${stats.frames} · meshes ${stats.meshes} · ${stats.size} · @${stats.target}px
 source ${sourceNote || "—"}
 ${stats.first}`}
                 </div>
