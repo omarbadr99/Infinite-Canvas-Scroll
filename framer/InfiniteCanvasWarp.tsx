@@ -822,6 +822,9 @@ export default function InfiniteCanvasWarp(props) {
                 for (const [, g] of activeChunks) rmChunk(g)
                 activeChunks.clear()
                 chunkImgCache.clear()
+                // Plate sizes come from the images, so a newly arrived texture
+                // invalidates the cached layouts too.
+                layoutCache.clear()
                 lastCx = null
                 lastCy = null
                 updChunks()
@@ -932,6 +935,7 @@ export default function InfiniteCanvasWarp(props) {
         /* ── chunks ── */
         const activeChunks = new Map<string, THREE.Group>()
         const chunkImgCache = new Map<string, number[]>()
+        const layoutCache = new Map<string, Placed[]>()
         let lastCx: number | null = null
         let lastCy: number | null = null
 
@@ -955,43 +959,133 @@ export default function InfiniteCanvasWarp(props) {
             return idx
         }
 
-        function mkChunk(cx: number, cy: number) {
-            const g = new THREE.Group()
+        type Placed = { px: number; py: number; w: number; h: number; ii: number }
+
+        /* Placement in two passes.
+
+           baseLayout is the original algorithm: deterministic from the chunk
+           coordinate alone, knowing nothing of its neighbours. Chunks are
+           generated independently, which is what makes the field infinite —
+           but it is also why the same image could land either side of a chunk
+           border and end up touching itself.
+
+           layoutFor then lays out a chunk for real while avoiding its
+           neighbours' base layouts, so a repeat has to clear minRepeat world
+           units from the same image next door. Neighbours are read at their
+           base layout rather than their final one, which keeps this one level
+           deep instead of recursing outward forever. */
+
+        function baseLayout(cx: number, cy: number): Placed[] {
+            const key = `${cx},${cy}`
+            const hit = layoutCache.get(key)
+            if (hit) return hit
             const rng = mulberry32(hashChunk(cx, cy))
             const CS = canvas.chunkSize
-            const ox = cx * CS
-            const oy = cy * CS
-            const placed: { px: number; py: number; w: number; h: number }[] = []
-
+            const out: Placed[] = []
             for (const ii of chunkImgs(cx, cy)) {
-                const img = imageData[ii]
-                const { w, h } = img
+                const { w, h } = imageData[ii]
                 let px = 0
                 let py = 0
                 let ok = false
                 for (let tries = 0; tries < 150; tries++) {
                     px = rng() * Math.max(1, CS - w)
                     py = rng() * Math.max(1, CS - h)
-                    let overlap = false
-                    for (const p of placed) {
-                        if (
-                            px - canvas.padding < p.px + p.w &&
-                            px + w + canvas.padding > p.px &&
-                            py - canvas.padding < p.py + p.h &&
-                            py + h + canvas.padding > p.py
-                        ) {
-                            overlap = true
-                            break
-                        }
-                    }
-                    if (!overlap) {
+                    if (!collides(out, px, py, w, h)) {
                         ok = true
                         break
                     }
                 }
                 if (!ok) continue
-                placed.push({ px, py, w, h })
+                out.push({ px, py, w, h, ii })
+            }
+            layoutCache.set(key, out)
+            return out
+        }
 
+        function collides(placed: Placed[], px: number, py: number, w: number, h: number) {
+            const pad = canvas.padding
+            for (const p of placed) {
+                if (
+                    px - pad < p.px + p.w &&
+                    px + w + pad > p.px &&
+                    py - pad < p.py + p.h &&
+                    py + h + pad > p.py
+                ) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        /* Which of two conflicting plates gives way. Depends only on the
+           chunk and the plate's index within it, so both chunks reach the same
+           verdict without either having to know the other's final layout. */
+        function priority(cx: number, cy: number, k: number) {
+            let h = hashChunk(cx, cy)
+            h = Math.imul(h ^ (k + 0x9e3779b9), 16777619)
+            return h >>> 0
+        }
+
+        function layoutFor(cx: number, cy: number): Placed[] {
+            const minD = canvas.minRepeat
+            if (minD <= 0) return baseLayout(cx, cy)
+
+            const CS = canvas.chunkSize
+            const ox = cx * CS
+            const oy = cy * CS
+            const mine = baseLayout(cx, cy)
+
+            // Every same-image plate in the 3x3 neighbourhood, this chunk
+            // included, as world-space centres carrying their tie-break rank.
+            type Ref = { x: number; y: number; ii: number; rank: number; self: number }
+            const around: Ref[] = []
+            for (let dx = -1; dx <= 1; dx++) {
+                for (let dy = -1; dy <= 1; dy++) {
+                    const gx = cx + dx
+                    const gy = cy + dy
+                    const nx = gx * CS
+                    const ny = gy * CS
+                    baseLayout(gx, gy).forEach((q, k) => {
+                        around.push({
+                            x: nx + q.px + q.w / 2,
+                            y: -(ny + q.py + q.h / 2),
+                            ii: q.ii,
+                            rank: priority(gx, gy, k),
+                            self: !dx && !dy ? k : -1,
+                        })
+                    })
+                }
+            }
+
+            /* Rather than nudge plates around — which needs a neighbour's final
+               layout and so recurses outward without end — a conflict is
+               settled by dropping one of the pair. Both chunks compare the same
+               two ranks and agree on which goes, so the result is consistent
+               across a border. A plate that loses any comparison is dropped,
+               which guarantees no surviving pair is closer than minRepeat. */
+            const out: Placed[] = []
+            mine.forEach((p, k) => {
+                const px = ox + p.px + p.w / 2
+                const py = -(oy + p.py + p.h / 2)
+                const rank = priority(cx, cy, k)
+                for (const q of around) {
+                    if (q.ii !== p.ii || q.self === k) continue
+                    if (Math.hypot(q.x - px, q.y - py) >= minD) continue
+                    if (q.rank < rank || (q.rank === rank && q.self < k)) return
+                }
+                out.push(p)
+            })
+            return out
+        }
+
+        function mkChunk(cx: number, cy: number) {
+            const g = new THREE.Group()
+            const CS = canvas.chunkSize
+            const ox = cx * CS
+            const oy = cy * CS
+
+            for (const { px, py, w, h, ii } of layoutFor(cx, cy)) {
+                const img = imageData[ii]
                 const mat = img.texture
                     ? new THREE.MeshBasicMaterial({ map: img.texture })
                     : new THREE.MeshBasicMaterial({ color: pendingColor })
@@ -1613,6 +1707,17 @@ addPropertyControls(InfiniteCanvasWarp, {
             perChunk: { type: ControlType.Number, title: "Plates / chunk", min: 1, max: 30, step: 1, defaultValue: 20 },
             chunkSize: { type: ControlType.Number, title: "Chunk size", min: 800, max: 6000, step: 100, defaultValue: 1500 },
             padding: { type: ControlType.Number, title: "Padding", min: 0, max: 300, step: 5, defaultValue: 80, unit: "px" },
+            minRepeat: {
+                type: ControlType.Number,
+                title: "Repeat spacing",
+                min: 0,
+                max: 4000,
+                step: 50,
+                defaultValue: 900,
+                unit: "px",
+                description:
+                    "How far apart the same image must stay. Raise it to spread repeats out; too high for the number of images and the field thins.",
+            },
             renderRadius: { type: ControlType.Number, title: "Render radius", min: 1, max: 4, step: 1, defaultValue: 2 },
             scrollSpeed: { type: ControlType.Number, title: "Scroll speed", min: 0.1, max: 5, step: 0.1, defaultValue: 1.5 },
             scrollSmoothing: { type: ControlType.Number, title: "Scroll smoothing", min: 0.02, max: 1, step: 0.01, defaultValue: 0.17 },
