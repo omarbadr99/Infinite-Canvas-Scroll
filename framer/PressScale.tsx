@@ -4,23 +4,34 @@ import { useEffect, useRef } from "react"
 /**
  * Press Scale — a Framer code component.
  *
- * The press gesture from the infinite canvas, applied to an ordinary Framer
- * page: hold the mouse down anywhere and the whole page eases down a few
- * percent, release and it springs back.
+ * Hold the mouse anywhere and the page eases away from you; release and it
+ * springs back. Drop one anywhere on a page; it draws nothing.
  *
- * Drop one anywhere on a page. It draws nothing — it listens on the window and
- * transforms the page wrapper, so a press counts wherever it lands, including
- * on links, buttons and anything else that would normally swallow the event.
+ * Three things decide how this is built, all of them learned the hard way:
  *
- * The wrapper it scales is found by climbing from this component to the
- * outermost element still inside <body>, which is the page root whatever
- * Framer happens to call it that week. A selector can override that.
+ * 1. It pivots on the cursor, not on the middle of the screen. Scaling about
+ *    any other point slides the page under the pointer, so the element beneath
+ *    pointerdown is not the element beneath pointerup — and a browser only
+ *    fires `click` when both land on the same element. Pivoting on the cursor
+ *    holds that one point still, so everything underneath stays clickable.
+ *    It also ties the gesture to where you actually pressed.
  *
- * Note: transforming an element makes it the containing block for any
- * `position: fixed` descendant. A fixed header inside the scaled wrapper will
- * scale and move with the page rather than staying pinned to the viewport —
- * usually what you want here, since the whole page is meant to shrink, but it
- * is the one thing that changes behaviour elsewhere on the site.
+ * 2. It transforms each top-level section, never one wrapper around them all.
+ *    A transform makes an element the containing block for its `fixed` and
+ *    `sticky` descendants, which is why a pinned section jumped to the top of
+ *    itself when the whole page was scaled. Transforming a sticky element
+ *    *itself* leaves its stickiness intact — only an ancestor breaks it. Since
+ *    every section scales by the same factor about the same document point,
+ *    the result is identical to scaling the page, minus the breakage.
+ *
+ * 3. It runs on a spring rather than a CSS ease, and the gap it opens takes
+ *    the colour of whatever you pressed on, so a full-bleed section does not
+ *    appear to have been cropped against a bare white edge.
+ *
+ * Nested sticky is the one case still beyond reach: if a pinned element sits
+ * inside a section rather than beside it, that section is its ancestor and the
+ * containing-block rule applies again. Point Target at a container whose
+ * direct children are the sections if the structure is nested.
  *
  * @framerIntrinsicWidth 1
  * @framerIntrinsicHeight 1
@@ -28,10 +39,6 @@ import { useEffect, useRef } from "react"
  * @framerSupportedLayoutHeight fixed
  * @framerDisableUnlink
  */
-
-/** Approximations of the canvas's easings, so the two gestures feel alike. */
-const EASE_IN = "cubic-bezier(0.075, 0.82, 0.165, 1)" // circ.out — quick bite
-const EASE_OUT = "cubic-bezier(0.25, 0.46, 0.45, 0.94)" // power2.out — soft return
 
 /** The outermost wrapper still inside <body> that contains us. */
 function pageRoot(from: HTMLElement): HTMLElement {
@@ -42,12 +49,32 @@ function pageRoot(from: HTMLElement): HTMLElement {
     return node
 }
 
+/** The nearest painted background behind a point — what the gap should be. */
+function backdropAt(x: number, y: number): string {
+    let el = document.elementFromPoint(x, y) as HTMLElement | null
+    while (el) {
+        const bg = getComputedStyle(el).backgroundColor
+        if (bg && bg !== "transparent" && !bg.startsWith("rgba(0, 0, 0, 0)")) return bg
+        el = el.parentElement
+    }
+    return ""
+}
+
 export default function PressScale(props) {
-    const { enabled, scale, pressIn, pressOut, radius, backdrop, selector, style } = props
+    const {
+        enabled,
+        scale,
+        speed,
+        bounce,
+        radius,
+        backdrop,
+        matchBackdrop,
+        selector,
+        style,
+    } = props
     const ref = useRef<HTMLDivElement>(null)
 
-    // Never on the Framer canvas: the page root there is the editor's own DOM,
-    // and scaling that would squash the editor rather than the design.
+    // Never on the Framer canvas: the page root there is the editor's own DOM.
     const live = RenderTarget.current() !== RenderTarget.canvas
 
     useEffect(() => {
@@ -55,66 +82,121 @@ export default function PressScale(props) {
         const here = ref.current
         if (!here) return
 
-        let target: HTMLElement | null = null
+        let container: HTMLElement | null = null
         if (selector) {
             try {
-                target = document.querySelector(selector)
+                container = document.querySelector(selector)
             } catch {
-                target = null
+                container = null
             }
         }
-        if (!target) target = pageRoot(here)
-        if (!target) return
+        // The page wrapper itself: its children are the sections. Taking its
+        // parent instead would leave one wrapper to transform, which is the
+        // arrangement that breaks pinned descendants.
+        if (!container) container = pageRoot(here)
+        if (!container) return
 
-        const previous = target.getAttribute("style") || ""
-        const previousBodyBg = document.body.style.background
-        target.style.willChange = "transform"
+        const sections = () =>
+            (Array.from(container!.children) as HTMLElement[]).filter(
+                (el) => el !== here && el.nodeType === 1 && !el.contains(here)
+            )
 
+        const restore = new Map<HTMLElement, string>()
+        const prevBodyBg = document.body.style.background
+
+        let current = 1
+        let velocity = 0
+        let goal = 1
+        let raf = 0
+        let last = 0
         let held = false
+        let painted: HTMLElement[] = []
 
-        /* The pivot has to be the middle of the screen, not the middle of the
-           element. A page several viewports tall has its centre far below the
-           fold, and scaling about that drags everything upward and off the top
-           instead of shrinking what you are looking at. Measured per press,
-           while the element is still untransformed, so it follows the scroll
-           position. */
-        const setOrigin = () => {
-            const doc = document.documentElement
-            const box = target!.getBoundingClientRect()
-            const elTop = box.top + window.scrollY
-            const elLeft = box.left + window.scrollX
-            const cx = window.scrollX + doc.clientWidth / 2 - elLeft
-            const cy = window.scrollY + doc.clientHeight / 2 - elTop
-            target!.style.transformOrigin = `${cx}px ${cy}px`
+        const applyOrigins = (docX: number, docY: number) => {
+            painted = sections()
+            for (const el of painted) {
+                if (!restore.has(el)) restore.set(el, el.getAttribute("style") || "")
+                const box = el.getBoundingClientRect()
+                // The box is already transformed if a press is still settling,
+                // so undo the current scale to recover the untransformed corner.
+                const left = box.left + window.scrollX
+                const top = box.top + window.scrollY
+                el.style.transformOrigin = `${docX - left}px ${docY - top}px`
+                el.style.willChange = "transform"
+                if (radius > 0) {
+                    el.style.borderRadius = `${radius}px`
+                    el.style.overflow = "hidden"
+                }
+            }
         }
 
-        const press = () => {
+        const paint = () => {
+            for (const el of painted) {
+                el.style.transform = current < 0.9999 ? `scale(${current})` : ""
+            }
+        }
+
+        const clear = () => {
+            for (const [el, css] of restore) el.setAttribute("style", css)
+            restore.clear()
+            painted = []
+            document.body.style.background = prevBodyBg
+        }
+
+        const tick = (now: number) => {
+            const dt = Math.min(0.032, last ? (now - last) / 1000 : 0.016)
+            last = now
+            // Critically-ish damped spring; bounce trades damping for overshoot.
+            const stiffness = 40 + speed * 260
+            const damping = (2 * Math.sqrt(stiffness)) * (1.05 - bounce * 0.5)
+            const accel = -stiffness * (current - goal) - damping * velocity
+            velocity += accel * dt
+            current += velocity * dt
+            paint()
+
+            const settled = Math.abs(current - goal) < 0.0005 && Math.abs(velocity) < 0.005
+            if (settled) {
+                current = goal
+                velocity = 0
+                paint()
+                raf = 0
+                last = 0
+                if (!held && goal === 1) clear()
+                return
+            }
+            raf = requestAnimationFrame(tick)
+        }
+
+        const run = () => {
+            if (!raf) {
+                last = 0
+                raf = requestAnimationFrame(tick)
+            }
+        }
+
+        const press = (e: PointerEvent) => {
             if (held) return
             held = true
-            setOrigin()
-            target!.style.transition = `transform ${pressIn}s ${EASE_IN}, border-radius ${pressIn}s ${EASE_IN}`
-            target!.style.transform = `scale(${scale})`
-            if (radius > 0) {
-                target!.style.overflow = "hidden"
-                target!.style.borderRadius = `${radius}px`
+            applyOrigins(e.pageX, e.pageY)
+            if (matchBackdrop || backdrop) {
+                const fill = backdrop || backdropAt(e.clientX, e.clientY)
+                if (fill) document.body.style.background = fill
             }
-            if (backdrop) document.body.style.background = backdrop
+            goal = scale
+            run()
         }
 
         const release = () => {
             if (!held) return
             held = false
-            target!.style.transition = `transform ${pressOut}s ${EASE_OUT}, border-radius ${pressOut}s ${EASE_OUT}`
-            target!.style.transform = "scale(1)"
-            if (radius > 0) target!.style.borderRadius = "0px"
+            goal = 1
+            run()
         }
 
         // Capture phase, so a handler that stops propagation cannot swallow it.
         window.addEventListener("pointerdown", press, true)
         window.addEventListener("pointerup", release, true)
         window.addEventListener("pointercancel", release, true)
-        // A press that ends off-window, or while switching tabs, still has to
-        // let go — otherwise the page stays shrunk.
         window.addEventListener("blur", release)
         document.addEventListener("visibilitychange", release)
 
@@ -124,10 +206,10 @@ export default function PressScale(props) {
             window.removeEventListener("pointercancel", release, true)
             window.removeEventListener("blur", release)
             document.removeEventListener("visibilitychange", release)
-            target!.setAttribute("style", previous)
-            document.body.style.background = previousBodyBg
+            if (raf) cancelAnimationFrame(raf)
+            clear()
         }
-    }, [live, enabled, scale, pressIn, pressOut, radius, backdrop, selector])
+    }, [live, enabled, scale, speed, bounce, radius, backdrop, matchBackdrop, selector])
 
     if (!live) {
         return (
@@ -166,25 +248,24 @@ addPropertyControls(PressScale, {
         max: 1,
         step: 0.005,
         defaultValue: 0.96,
-        description: "How far the page shrinks while the mouse is held down.",
+        description: "How far the page eases back while the mouse is held down.",
     },
-    pressIn: {
+    speed: {
         type: ControlType.Number,
-        title: "Down",
-        min: 0.05,
-        max: 2,
+        title: "Speed",
+        min: 0,
+        max: 1,
         step: 0.05,
         defaultValue: 0.45,
-        unit: "s",
     },
-    pressOut: {
+    bounce: {
         type: ControlType.Number,
-        title: "Up",
-        min: 0.05,
-        max: 2,
+        title: "Bounce",
+        min: 0,
+        max: 1,
         step: 0.05,
-        defaultValue: 0.85,
-        unit: "s",
+        defaultValue: 0.3,
+        description: "How much it overshoots on the way back. 0 settles flat.",
     },
     radius: {
         type: ControlType.Number,
@@ -194,13 +275,19 @@ addPropertyControls(PressScale, {
         step: 1,
         defaultValue: 0,
         unit: "px",
-        description: "Rounds the page while pressed, so the inset reads as deliberate.",
+    },
+    matchBackdrop: {
+        type: ControlType.Boolean,
+        title: "Match gap",
+        defaultValue: true,
+        description:
+            "Fills the gap with the colour of whatever you pressed on, so a full-bleed section does not look cropped.",
     },
     backdrop: {
         type: ControlType.Color,
-        title: "Behind",
+        title: "Gap colour",
         defaultValue: "",
-        description: "What shows in the gap the shrinking page leaves. Empty leaves it alone.",
+        description: "Overrides Match gap with one fixed colour.",
     },
     selector: {
         type: ControlType.String,
@@ -208,6 +295,6 @@ addPropertyControls(PressScale, {
         placeholder: "auto",
         defaultValue: "",
         description:
-            "Leave empty to scale the whole page. A CSS selector scales just that element instead.",
+            "The container whose direct children get scaled. Empty finds the page wrapper.",
     },
 })
