@@ -43,7 +43,7 @@ function pageRoot(from: HTMLElement): HTMLElement {
 }
 
 export default function PressScale(props) {
-    const { enabled, scale, pressIn, pressOut, selector, style } = props
+    const { enabled, scale, pressIn, pressOut, radius, backdrop, selector, style } = props
     const ref = useRef<HTMLDivElement>(null)
 
     // Never on the Framer canvas: the page root there is the editor's own DOM,
@@ -67,21 +67,46 @@ export default function PressScale(props) {
         if (!target) return
 
         const previous = target.getAttribute("style") || ""
-        target.style.transformOrigin = "50% 50%"
+        const previousBodyBg = document.body.style.background
         target.style.willChange = "transform"
 
         let held = false
+
+        /* The pivot has to be the middle of the screen, not the middle of the
+           element. A page several viewports tall has its centre far below the
+           fold, and scaling about that drags everything upward and off the top
+           instead of shrinking what you are looking at. Measured per press,
+           while the element is still untransformed, so it follows the scroll
+           position. */
+        const setOrigin = () => {
+            const doc = document.documentElement
+            const box = target!.getBoundingClientRect()
+            const elTop = box.top + window.scrollY
+            const elLeft = box.left + window.scrollX
+            const cx = window.scrollX + doc.clientWidth / 2 - elLeft
+            const cy = window.scrollY + doc.clientHeight / 2 - elTop
+            target!.style.transformOrigin = `${cx}px ${cy}px`
+        }
+
         const press = () => {
             if (held) return
             held = true
-            target!.style.transition = `transform ${pressIn}s ${EASE_IN}`
+            setOrigin()
+            target!.style.transition = `transform ${pressIn}s ${EASE_IN}, border-radius ${pressIn}s ${EASE_IN}`
             target!.style.transform = `scale(${scale})`
+            if (radius > 0) {
+                target!.style.overflow = "hidden"
+                target!.style.borderRadius = `${radius}px`
+            }
+            if (backdrop) document.body.style.background = backdrop
         }
+
         const release = () => {
             if (!held) return
             held = false
-            target!.style.transition = `transform ${pressOut}s ${EASE_OUT}`
+            target!.style.transition = `transform ${pressOut}s ${EASE_OUT}, border-radius ${pressOut}s ${EASE_OUT}`
             target!.style.transform = "scale(1)"
+            if (radius > 0) target!.style.borderRadius = "0px"
         }
 
         // Capture phase, so a handler that stops propagation cannot swallow it.
@@ -100,8 +125,9 @@ export default function PressScale(props) {
             window.removeEventListener("blur", release)
             document.removeEventListener("visibilitychange", release)
             target!.setAttribute("style", previous)
+            document.body.style.background = previousBodyBg
         }
-    }, [live, enabled, scale, pressIn, pressOut, selector])
+    }, [live, enabled, scale, pressIn, pressOut, radius, backdrop, selector])
 
     if (!live) {
         return (
@@ -159,6 +185,22 @@ addPropertyControls(PressScale, {
         step: 0.05,
         defaultValue: 0.85,
         unit: "s",
+    },
+    radius: {
+        type: ControlType.Number,
+        title: "Corners",
+        min: 0,
+        max: 64,
+        step: 1,
+        defaultValue: 0,
+        unit: "px",
+        description: "Rounds the page while pressed, so the inset reads as deliberate.",
+    },
+    backdrop: {
+        type: ControlType.Color,
+        title: "Behind",
+        defaultValue: "",
+        description: "What shows in the gap the shrinking page leaves. Empty leaves it alone.",
     },
     selector: {
         type: ControlType.String,
